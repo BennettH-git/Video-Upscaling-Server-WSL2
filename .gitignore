@@ -1,0 +1,20 @@
+#Python virtual environment
+venv/
+pycache/
+*.pyc
+
+#Separate code from data and runtime artifacts
+input/
+output/
+temp/
+logs/
+queue.txt
+
+#Ignore downloaded AI model files
+Real-ESRGAN/experiments/
+Real-ESRGAN/results/
+*.pth
+
+#IDE and editor-specific configuration
+.vscode/
+.idea/
