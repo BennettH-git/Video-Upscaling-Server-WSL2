@@ -11,8 +11,7 @@ logs/
 queue.txt
 
 #Ignore downloaded AI model files
-Real-ESRGAN/experiments/
-Real-ESRGAN/results/
+Real-ESRGAN/
 *.pth
 
 #IDE and editor-specific configuration
