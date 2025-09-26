@@ -1,0 +1,17 @@
+# Core deep learning framework for REAL-ESRGAN
+torch
+torchvision
+torchaudio
+
+# For filesystem monitoring and automation
+watchdog
+
+# For stitching tiled frames back together
+Pillow
+
+# Dependencies required by the REAL-ESRGAN repository
+numpy
+opencv-python
+glob2
+gfpgan
+basicsr
