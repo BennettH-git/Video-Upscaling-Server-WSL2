@@ -1,6 +1,6 @@
 # AI Video Upscaling Server (Public Version 2.2 - Resumable)
 
-Ahis server provides a fully automated pipeline for upscaling video files using the REAL-ESRGAN deep learning model. It is designed for stable, hands-off, and fault-tolerant operation within a WSL2/Ubuntu environment.
+This server provides a fully automated pipeline for upscaling video files using the REAL-ESRGAN deep learning model. It is designed for stable, hands-off, and fault-tolerant operation within a WSL2/Ubuntu environment.
 
 This project has undergone significant iterative development to solve performance bottlenecks and environmental instabilities. The final architecture is a robust system that prioritizes stability, performance, and recoverability.
 ## Key Features
