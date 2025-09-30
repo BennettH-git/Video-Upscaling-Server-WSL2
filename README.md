@@ -1,100 +1,61 @@
-# Automated AI Video Upscaling Server
+# AI Video Upscaling Server (Public Version 2.2 - Resumable)
 
-An automated AI video upscaling pipeline orchestrated by Python. Manages a sequential job queue for stability and system resources via VRAM-aware tiling. Features a filesystem watcher and GPU-accelerated (NVENC) encoding in a Linux environment. Built with FFmpeg & PyTorch/REAL-ESRGAN.
-Key Features
+Ahis server provides a fully automated pipeline for upscaling video files using the REAL-ESRGAN deep learning model. It is designed for stable, hands-off, and fault-tolerant operation within a WSL2/Ubuntu environment.
 
-This project is designed as a robust, hands-off service for AI-powered video super-resolution. It emphasizes stability and automation, making it suitable for continuous operation.
+This project has undergone significant iterative development to solve performance bottlenecks and environmental instabilities. The final architecture is a robust system that prioritizes stability, performance, and recoverability.
+## Key Features
 
-  - Fully Automated Workflow: A watchdog-based sentinel monitors a directory for new video files and automatically triggers the entire processing pipeline.
+  - Automated Job Ingestion & Queuing: Uses watchdog to monitor an input/ directory and automatically adds new video files to a persistent queue.txt file for sequential processing.
+  
+  - Fault Tolerance & Job Resumption: This is the most critical feature. The server creates a persistent status.json file for each job. If the server is shut down or crashes, it will automatically scan the input directory upon restart and add any unfinished jobs back to the queue, seamlessly resuming from the last completed batch. This can and will save an incredible amount of reprocessing time.
+  
+  - RAM Disk: To protect SSD longevity and maximize I/O performance, the server automatically creates a RAM disk at the start of each job for all temporary frame processing and destroys it upon completion, freeing all RAM when idle.
+  
+  - RAM Disk Spillover: For long jobs, completed intermediate video clips are automatically moved from the RAM disk to a persistent folder on the physical disk to prevent the RAM disk from overflowing.
+  
+  - VRAM-Aware Manual Tiling: The server includes a robust, automated pre-processing step. For high-resolution frames (wider than 1920px), it uses the Pillow library to slice them into smaller tiles before upscaling and stitches them back together afterward.
 
-  - Stable Job Queuing: A simple but effective file-based job queue ensures that videos are processed sequentially, preventing resource contention and system overloads when multiple files are added simultaneously.
+  - CPU encoding Fallback: The server attempts to use the h264_nvenc GPU-accelerated video encoder. If this fails due to unavoidable driver instability in WSL2, it will automatically fall back to the reliable (but slower) libx264 CPU encoder to ensure the job always completes.
 
-  - VRAM-Aware Tiling: The server automatically detects high-resolution input videos (above 1080p) and engages a manual tiling-and-stitching workflow to process frames in manageable chunks, preventing CUDA out-of-memory errors on consumer GPUs.
-
-  - GPU-Accelerated Encoding: The final video reconstruction stage uses FFmpeg's h264_nvenc encoder to offload the computationally expensive encoding task from the CPU to the NVIDIA GPU's dedicated hardware, significantly improving performance and freeing up system resources.
-
-
-
-## The Workflow
-
-When a new video is detected, the server executes the following multi-stage pipeline:
-
-  1. Enqueue & Dequeue: The video path is added to queue.txt. A worker loop pulls the next available job from the queue.
-  2. Inspect: ffprobe extracts the video's resolution and frame rate to inform later stages of the pipeline.
-  3. Deconstruct: FFmpeg extracts the original audio track (preserving its quality) and splits the video into a sequence of lossless PNG frames.
-  4. Upscale (with Tiling Logic):
-        If the video is high-resolution, frames are tiled into smaller pieces. These tiles are upscaled by REAL-ESRGAN. The upscaled tiles are then stitched back together into full frames.
-        If the video is standard resolution, the frames are passed directly to REAL-ESRGAN for upscaling.
-  5. Reconstruct: The sequence of upscaled frames is encoded into a new, high-resolution H.264 video stream using the GPU's NVENC hardware encoder.
-  6. Reintegrate: The new video stream is combined with the original audio track.
-  7. Cleanup: All temporary files (frames, tiles, audio clips) are automatically deleted.
-
-## Technology Stack
-
-  - Orchestration: Python 3.10+
-  - Media Processing: FFmpeg
-  - AI Model: REAL-ESRGAN (via PyTorch)
-  - Filesystem Monitoring: Watchdog
-  - Image Manipulation: Pillow
-  - Environment: WSL2 (Ubuntu 22.04) or a dedicated Linux server
-
+  - ETA Calculation: The server processes a small, 30-frame initial batch to provide a quick and reasonably accurate Estimated Time of Arrival for the entire job. This batch size can be adjusted at the start of the code for a more accurate, but less rapid, ETA.
+  
 ## Project Structure
 
-```video_upscaler/
+```
+video-upscaling-server/
 │
+├── .git/
 ├── .gitignore
-├── input/                  # Drop source videos here
-├── logs/                   # Server operation logs are stored here
-├── output/                 # Final upscaled videos are saved here
-├── queue.txt               # The file-based job queue
-├── Real-ESRGAN/            # The cloned REAL-ESRGAN repository (dependency)
+├── input/                  # Drop source videos here for automatic processing.
+├── logs/                   # Server operation logs are stored here.
+├── output/                 # Final upscaled videos & persistent job directories.
+├── queue.txt               # The file-based job queue.
+├── Real-ESRGAN/            # Cloned dependency, contains the AI model code.
 ├── README.md
-├── requirements.txt        # Python dependencies
-└── upscale_server.py       # The main orchestration script
+├── requirements.txt        # Python dependencies for a reproducible environment.
+├── upscale_server.py       # The main script
+└── venv/                   
 ```
 
-## Setup and Installation
-### Prerequisites
+## Technology Stack & Environment
 
-  - An NVIDIA GPU with CUDA support (12GB+ VRAM recommended for 4K).
-  - A configured WSL2/Ubuntu 22.04 environment or a dedicated Ubuntu server.
-  - Correctly installed NVIDIA drivers and the CUDA Toolkit.
-  - FFmpeg installed (can be done in terminal).
+  - Operating System: Ubuntu 24.04 LTS (Recommended, I am running on WSL2)
+  - NVIDIA Driver: Studio Driver (v581.29+)
+  - Python Version: 3.12+
+  - PyTorch CUDA Toolkit Version: 12.1. This is the most critical environmental parameter. To ensure compatibility with Ubuntu's pre-compiled FFmpeg and achieve stable nvenc encoding, the Python environment must use the PyTorch libraries built for the CUDA 12.1 toolkit.
+  - Core Python Dependencies: torch==2.5.1+cu121, torchvision==0.20.1+cu121, torchaudio==2.5.1+cu121, opencv-python==4.12.0.88, watchdog==6.0.0, Pillow==11.3.0. A complete list is in requirements.txt.
+
+
     
-### Installation Steps 
-Note: The script assumes this directory is named Real-ESRGAN and resides in the project root.
-  1. Clone the Repository
-  
-    git clone [https://github.com/BennettH-git/Video-Upscaling-Server-WSL2.git](https://github.com/BennettH-git/Video-Upscaling-Server-WSL2.git)
-    
-    cd BennettH-git/Video-Upscaling-Server-WSL2
-    
-  2. Set up Python Environment: It is highly recommended to use a virtual environment.
-  
-    python3 -m venv venv
+## Usage
+  1. Activate the Virtual Environment:
     
     source venv/bin/activate
-
-  3. Install Python Dependencies: The requirements.txt file contains all necessary packages.
-  
-    pip install -r requirements.txt
-
-  4. Download REAL-ESRGAN: Clone the model repository, which contains the inference script and pre-trained models.
     
-    git clone [https://github.com/xinntao/Real-ESRGAN.git](https://github.com/xinntao/Real-ESRGAN.git)
-
-
-### Usage
-
-To start the server, simply run the main Python script from the project's root directory:
+  2. Start the Server:
 
     python upscale_server.py
 
-The server will initialize and begin monitoring the input/ directory.
+  3. Process Videos: Simply copy or move your video files (.mp4, .mkv, .mov, etc.) into the input/ directory. The server will automatically detect them, add them to the queue, and begin processing.
 
-To process a video, place a video file into the input/ folder. The server will automatically detect it based upon file type, add it to the queue, and begin processing. The final, upscaled video will appear in the output/ directory when the job is complete.
-
-To shut down the server press Ctrl+C in the terminal where it is running.
-
-
-PS, this will likely make the room quite warm while upscale videos continuously if you dont crack a window or something.
+  4. Find Output: Completed upscaled videos will appear in the output/ directory. For each job, a corresponding sub-directory (e.g., output/my_video/) is created to hold the persistent status.json file and intermediate clips. By default, this directory is deleted upon successful completion to save space.
