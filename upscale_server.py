@@ -18,8 +18,9 @@ REALESRGAN_DIR = os.path.join(PROJECT_ROOT, 'Real-ESRGAN')
 INPUT_DIR = os.path.join(PROJECT_ROOT, 'input')
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'output')
 LOGS_DIR = os.path.join(PROJECT_ROOT, 'logs')
+TEMP_DIR_BASE = os.path.join(PROJECT_ROOT, 'temp')
 
-# --- RAM Disk Configuration ---
+# --- Just-in-Time RAM Disk Configuration ---
 USE_RAM_DISK = False                       # RAM_DISK_SIZE is important to change based upon your systems memory. 
 RAM_DISK_MOUNT_POINT = "/mnt/ramdisk"      # More ram means bigger batches and less I/O processing time to let the GPU do the heavy lifting.
 RAM_DISK_SIZE_GB = 32                      # Off by default because it is complicated to set up, but absolutely necessary to prevent SSD wear if youre using this script often.
@@ -32,12 +33,12 @@ TILING_THRESHOLD_WIDTH = 1920                                                   
 TILE_SIZE = 512                                                                        # I am afraid it will introduce artifacts though
 UPSCALE_FACTOR = 4
 
-# --- Adaptive Batch Processing & Job Control ---
-ETA_BATCH_SIZE = 30                                            # Smaller first batch, ETA is a worst case estimate.
-TARGET_PIXELS_PER_BATCH = 1280 * 720 * 600
-MIN_BATCH_SIZE = 100                                           # Might need to be lowered if youre using a very small ram disk or your GPU was left out in the rain.
-MAX_BATCH_SIZE = 1500
-CLEANUP_ON_COMPLETE = True                                     # Set to False to keep intermediate clips for debugging. SAM2 implementation would be cool, but is another massive project.
+# --- Adaptive Batch Processing & Job Control ---                 #Note: the batch processing architecture changed from the previous version to prevent crashes caused by running out of VRAM
+ETA_BATCH_SIZE = 30                                                   # Smaller first batch, ETA is a worst case estimate.
+MIN_BATCH_SIZE = 50                                                   
+MAX_BATCH_SIZE = 4000
+RAM_DISK_UTILIZATION_TARGET = 0.75
+CLEANUP_ON_COMPLETE = True                                            # Set to False to keep intermediate clips for debugging. SAM2 implementation would be cool, but is another massive project.
 
 # --- Stability Configuration ---
 RECONSTRUCTION_RETRY_ATTEMPTS = 3             # Typically either works or it doesnt. CPU fallback is good enough for right now.
@@ -54,8 +55,8 @@ SUPPORTED_VIDEO_FORMATS = ('.mp4', '.mkv', '.mov', '.avi', '.webm')
 def check_dependencies():
     """Performs pre-flight checks for critical files."""
     logging.info("Performing dependency pre-flight checks...")
-    if not os.path.isfile(REALESRGAN_SCRIPT_PATH):                                                                 # Note that you will still have to install the requirements for these
-        logging.critical(f"REAL-ESRGAN script not found at: {REALESRGAN_SCRIPT_PATH}")                             # They are well put together projects and I trust their requirements.txt
+    if not os.path.isfile(REALESRGAN_SCRIPT_PATH):
+        logging.critical(f"REAL-ESRGAN script not found at: {REALESRGAN_SCRIPT_PATH}")
         return False
     
     if not os.path.exists(MODEL_PATH):
@@ -106,45 +107,66 @@ def setup_job_directories(job_dir):
         os.makedirs(os.path.join(TEMP_DIR_FRAMES, dir_name), exist_ok=True)
 
 def cleanup_batch_frames():
-    """Cleans out the ephemeral frame directories between batches."""                                        # Needed to prevent script hang from the mounted drive running out of space after enough batches.
-    for dir_name in ['frames_raw', 'frames_raw_tiled', 'frames_upscaled_tiled', 'frames_upscaled']:          # Also prevents running out of storage on permanent storage devices.
+    """Cleans out the ephemeral frame directories between batches."""                                       # Prevents running out of space on mounted drive
+    for dir_name in ['frames_raw', 'frames_raw_tiled', 'frames_upscaled_tiled', 'frames_upscaled']:
         dir_path = os.path.join(TEMP_DIR_FRAMES, dir_name)
         if os.path.exists(dir_path):
             shutil.rmtree(dir_path)
             os.makedirs(dir_path)
 
 def get_video_properties(input_video_path):
-    """Extracts video resolution, frame rate, and total frame count."""
-    logging.info(f"Extracting video properties for {os.path.basename(input_video_path)}...")
+    """Extracts video properties."""                                                                       # Added a fallback and JSON transcription of the relevant properties to boot faster
+    logging.info(f"Extracting video properties for {os.path.basename(input_video_path)}...")               # Certain file types were previously breaking the script since FPS wasnt a value, it now calculates FPS
     try:
         ffprobe_command = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,r_frame_rate,nb_frames', '-of', 'default=noprint_wrappers=1:nokey=1', input_video_path]
         result = subprocess.run(ffprobe_command, capture_output=True, text=True, check=True)
         output = result.stdout.strip().split('\n')
         
         if len(output) < 4: raise ValueError(f"ffprobe returned incomplete data: {output}")
-        width, height, frame_rate_str, total_frames_str = output[:4]
-        if 'N/A' in total_frames_str: raise ValueError("ffprobe could not determine total frames.")
+        width_str, height_str, frame_rate_str, total_frames_str = output[:4]
         
+        if 'N/A' in total_frames_str:
+            logging.warning("Metadata frame count missing. Performing stream scan...")
+            count_command = ['ffprobe', '-v', 'error', '-count_frames', '-select_streams', 'v:0', '-show_entries', 'stream=nb_read_frames', '-of', 'default=noprint_wrappers=1:nokey=1', input_video_path]
+            count_result = subprocess.run(count_command, capture_output=True, text=True, check=True)
+            total_frames_str = count_result.stdout.strip()
+            if not total_frames_str or 'N/A' in total_frames_str:
+                raise ValueError("Robust frame count also failed.")
+            logging.info(f"Accurate frame count found: {total_frames_str}")
+
         num, den = map(int, frame_rate_str.split('/'))
         if den == 0: raise ValueError("Invalid frame rate denominator.")
 
-        properties = {'width': int(width), 'height': int(height), 'frame_rate_str': frame_rate_str, 'frame_rate_float': num / den, 'total_frames': int(total_frames_str)}
+        properties = {'width': int(width_str), 'height': int(height_str), 'frame_rate_str': frame_rate_str, 'frame_rate_float': num / den, 'total_frames': int(total_frames_str)}
         logging.info(f"Properties found: {properties['width']}x{properties['height']} @ {properties['frame_rate_str']} fps, {properties['total_frames']} total frames")
         return properties
     except Exception as e:
         logging.error(f"Failed to get video properties: {e}", exc_info=True)
         return None
 
-def calculate_adaptive_batch_size(width, height):
-    """Calculates an optimal batch size based on video resolution."""
-    pixels_per_frame = width * height
-    if pixels_per_frame == 0: return MIN_BATCH_SIZE
+def calculate_disk_aware_batch_size(width, height):
+    """Calculates batch size based on available disk space and frame dimensions."""
+    try:
+        _, _, free = shutil.disk_usage(TEMP_DIR_FRAMES)
+        usable_space = free * RAM_DISK_UTILIZATION_TARGET
+        
+        bytes_per_pixel = 3 # RGB
+        raw_size = width * height * bytes_per_pixel
+        upscaled_size = (width * UPSCALE_FACTOR) * (height * UPSCALE_FACTOR) * bytes_per_pixel
+        space_per_frame = raw_size + upscaled_size
 
-    calculated_size = int(TARGET_PIXELS_PER_BATCH / pixels_per_frame)
-    adaptive_size = max(MIN_BATCH_SIZE, min(calculated_size, MAX_BATCH_SIZE))
-    
-    logging.info(f"Calculated adaptive batch size: {adaptive_size} frames (clamped from {calculated_size})")
-    return adaptive_size
+        if space_per_frame == 0: return MIN_BATCH_SIZE
+
+        calculated_size = int(usable_space / space_per_frame)
+        
+        adaptive_size = max(MIN_BATCH_SIZE, min(calculated_size, MAX_BATCH_SIZE))
+        
+        logging.info(f"Disk-aware batch size calculation: Available space={free/(1024**3):.2f}GB, Final={adaptive_size}")
+        return adaptive_size
+
+    except Exception as e:
+        logging.error(f"Could not determine disk-aware batch size: {e}. Falling back to MIN_BATCH_SIZE.", exc_info=True)
+        return MIN_BATCH_SIZE
 
 def log_gpu_status():
     """Logs the output of nvidia-smi."""
@@ -167,8 +189,8 @@ def deconstruct_video_batch(input_video_path, start_frame, num_frames, frame_rat
         logging.error(f"FFmpeg failed during deconstruction. Stderr: {e.stderr}", exc_info=True)
         return False
 
-def upscale_frames_controller(width):
-    """Decides whether to use standard or tiled upscaling based on frame width."""             # Not exhaustively tested. 
+def upscale_frames_controller(width):                                                          # I/O overhead is still an issue in WSL2, when I was looking into it I was seeing that it may also be a problem on bare metal linux
+    """Decides whether to use standard or tiled upscaling based on frame width."""            
     raw_frames_dir = os.path.join(TEMP_DIR_FRAMES, 'frames_raw')
     tiled_raw_frames_dir = os.path.join(TEMP_DIR_FRAMES, 'frames_raw_tiled')
     tiled_upscaled_frames_dir = os.path.join(TEMP_DIR_FRAMES, 'frames_upscaled_tiled')
@@ -184,8 +206,8 @@ def upscale_frames_controller(width):
         upscale_frames_subprocess(raw_frames_dir, upscaled_frames_dir)
 
 def slice_frames_into_tiles(raw_dir, tiled_dir):
-    """Uses Pillow to slice each raw frame into smaller tiles."""                               # Still not exhaustively tested.
-    logging.info("Slicing full-resolution frames into tiles...")                                # Not sure of the impact on I/O vs GPU utilization
+    """Uses Pillow to slice each raw frame into smaller tiles."""
+    logging.info("Slicing full-resolution frames into tiles...")
     frames = sorted(os.listdir(raw_dir))
     for frame_name in frames:
         try:
@@ -243,8 +265,8 @@ def stitch_tiles_into_frames(tiled_upscaled_dir, final_dir):
         except Exception as e:
             logging.error(f"Failed to stitch tiles for frame {frame_base}: {e}", exc_info=True)
 
-def upscale_frames_subprocess(input_dir, output_dir):
-    """Upscales frames using a robust subprocess call."""                                                                             # This is the resource intensive part.
+def upscale_frames_subprocess(input_dir, output_dir):                                                                                   # The resource intensive part for the GPU.
+    """Upscales frames using a robust subprocess call."""
     logging.info(f"Starting subprocess upscaling for frames in '{os.path.basename(input_dir)}'...")
     try:
         command = [sys.executable, REALESRGAN_SCRIPT_PATH, '-i', input_dir, '-o', output_dir, '-n', MODEL_NAME, '--suffix', 'out']
@@ -279,14 +301,14 @@ def upscale_frames_subprocess(input_dir, output_dir):
         raise
 
 def reconstruct_and_spill_batch(batch_num, frame_rate_str, start_frame_num, job_dir):
-    """Reconstructs a video clip and immediately moves it to the physical disk."""                                   # Storing processed batches on the ram disk is not practical unless youre made out of gold.
+    """Reconstructs a video clip and saves it directly to the physical disk."""                                   # For practicality sake
     logging.info(f"Reconstructing video clip for batch {batch_num}...")
-    temp_clip_path = os.path.join(TEMP_DIR_FRAMES, f'clip_{batch_num:04d}.mp4')
     final_clip_path = os.path.join(job_dir, 'final_clips', f'clip_{batch_num:04d}.mp4')
     
     input_pattern = os.path.join(TEMP_DIR_FRAMES, 'frames_upscaled', 'frame_%06d_out.png')
     
-    gpu_command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-framerate', frame_rate_str, '-start_number', str(start_frame_num), '-i', input_pattern, '-c:v', 'h264_nvenc', '-pix_fmt', 'yuv420p', '-y', temp_clip_path]
+    # --- ARCHITECTURE FIX: Write directly to the final destination ---
+    gpu_command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-framerate', frame_rate_str, '-start_number', str(start_frame_num), '-i', input_pattern, '-c:v', 'h264_nvenc', '-pix_fmt', 'yuv420p', '-y', final_clip_path]
     
     for attempt in range(RECONSTRUCTION_RETRY_ATTEMPTS):
         try:
@@ -296,9 +318,7 @@ def reconstruct_and_spill_batch(batch_num, frame_rate_str, start_frame_num, job_
                 time.sleep(delay)
             logging.info(f"Attempting GPU encoding (h264_nvenc)... Attempt {attempt + 1}")
             subprocess.run(gpu_command, check=True, capture_output=True, text=True)
-            logging.info("GPU encoding successful.")
-            shutil.move(temp_clip_path, final_clip_path)
-            logging.info(f"Spilled clip to physical disk: {final_clip_path}")
+            logging.info(f"GPU encoding successful. Clip saved to: {final_clip_path}")
             return
         except subprocess.CalledProcessError as e:
             logging.warning(f"GPU encoding attempt {attempt + 1} failed.")
@@ -310,12 +330,10 @@ def reconstruct_and_spill_batch(batch_num, frame_rate_str, start_frame_num, job_
                  logging.warning(f"Transient GPU error detected. Stderr: {e.stderr}")
 
     logging.warning("Falling back to CPU encoding (libx264).")
-    cpu_command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-framerate', frame_rate_str, '-start_number', str(start_frame_num), '-i', input_pattern, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-y', temp_clip_path]
+    cpu_command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-framerate', frame_rate_str, '-start_number', str(start_frame_num), '-i', input_pattern, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-y', final_clip_path]
     try:
         subprocess.run(cpu_command, check=True, capture_output=True, text=True)
-        logging.info("CPU encoding successful.")
-        shutil.move(temp_clip_path, final_clip_path)
-        logging.info(f"Spilled clip to physical disk: {final_clip_path}")
+        logging.info(f"CPU encoding successful. Clip saved to: {final_clip_path}")
     except Exception as e:
         logging.error(f"FATAL: CPU encoding fallback failed. Stderr: {getattr(e, 'stderr', e)}", exc_info=True)
         raise
@@ -359,21 +377,32 @@ def process_video(input_video_path):
         setup_job_directories(job_dir)
         
         if os.path.exists(status_file):
-            with open(status_file, 'r') as f:
-                status = json.load(f)
+            with open(status_file, 'r') as f: status = json.load(f)
             logging.info(f"Resuming job for {filename}. Status file found.")
         else:
             status = {'completed_batches': []}
             logging.info(f"Starting new job for {filename}.")
 
-        properties = get_video_properties(input_video_path)
-        if not properties: raise ValueError("Failed to get video properties.")
+        properties = status.get('properties')
+        if not properties:
+            logging.warning("Video properties not found in status file. Re-analyzing video.")
+            properties = get_video_properties(input_video_path)
+            if properties: status['properties'] = properties
+            else: raise ValueError("Failed to get video properties for a new or incomplete job.")
 
-        adaptive_batch_size = calculate_adaptive_batch_size(properties['width'], properties['height'])
+        adaptive_batch_size = status.get('adaptive_batch_size')
+        if not adaptive_batch_size:
+            logging.warning("Batch size not found in status file. Re-calculating.")
+            adaptive_batch_size = calculate_disk_aware_batch_size(properties['width'], properties['height'])
+            if adaptive_batch_size: status['adaptive_batch_size'] = adaptive_batch_size
+            else: raise ValueError("Failed to calculate batch size.")
+        
+        with open(status_file, 'w') as f: json.dump(status, f, indent=4)
+
         total_frames = properties['total_frames']
-
         audio_dir_frames = os.path.join(TEMP_DIR_FRAMES, 'audio')
         temp_audio_path = os.path.join(audio_dir_frames, f'{base_filename}_audio.aac')
+        
         if not os.path.exists(temp_audio_path):
             logging.info("Extracting full audio track...")
             audio_extract_command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', input_video_path, '-vn', '-c:a', 'copy', '-y', temp_audio_path]
@@ -381,17 +410,24 @@ def process_video(input_video_path):
         else:
             logging.info("Audio track already exists. Skipping extraction.")
 
+        # Batching logic
         if total_frames <= ETA_BATCH_SIZE:
-            num_total_batches = 1
+            batch_definitions = [(0, total_frames)]
         else:
+            batch_definitions = [(0, ETA_BATCH_SIZE)]
             remaining_frames = total_frames - ETA_BATCH_SIZE
-            num_regular_batches = math.ceil(remaining_frames / adaptive_batch_size)
-            num_total_batches = 1 + num_regular_batches
+            current_frame = ETA_BATCH_SIZE
+            while remaining_frames > 0:
+                frames_in_this_batch = min(adaptive_batch_size, remaining_frames)
+                batch_definitions.append((current_frame, frames_in_this_batch))
+                remaining_frames -= frames_in_this_batch
+                current_frame += frames_in_this_batch
         
+        num_total_batches = len(batch_definitions)
         job_start_time = time.time()
         frames_processed_so_far = sum(status.get('frames_in_batch', {}).values())
 
-        for i in range(num_total_batches):
+        for i, (start_frame, num_frames_in_batch) in enumerate(batch_definitions):
             batch_num = i + 1
             if str(batch_num) in status.get('completed_batches', []):
                 logging.info(f"--- Skipping Batch {batch_num}/{num_total_batches} (already complete) ---")
@@ -399,17 +435,7 @@ def process_video(input_video_path):
 
             logging.info(f"--- Processing Batch {batch_num}/{num_total_batches} ---")
             
-            if i == 0:
-                num_frames_in_batch = min(ETA_BATCH_SIZE, total_frames)
-                start_frame = 0
-            else:
-                start_frame = ETA_BATCH_SIZE + ((i - 1) * adaptive_batch_size)
-                num_frames_in_batch = min(adaptive_batch_size, total_frames - start_frame)
-            
-            if num_frames_in_batch <= 0: continue
-
             cleanup_batch_frames()
-
             if not deconstruct_video_batch(input_video_path, start_frame, num_frames_in_batch, properties['frame_rate_float']):
                 raise RuntimeError("Failed to deconstruct video batch.")
 
@@ -418,21 +444,17 @@ def process_video(input_video_path):
             
             status['completed_batches'].append(str(batch_num))
             status.setdefault('frames_in_batch', {})[str(batch_num)] = num_frames_in_batch
-            with open(status_file, 'w') as f:
-                json.dump(status, f, indent=4)
+            with open(status_file, 'w') as f: json.dump(status, f, indent=4)
             
             if i == 0 and 'eta_logged' not in status:
                 first_batch_duration = time.time() - job_start_time
                 time_per_frame = first_batch_duration / num_frames_in_batch if num_frames_in_batch > 0 else 0
-                
                 if time_per_frame > 0:
                     estimated_total_seconds = time_per_frame * total_frames
                     logging.info(f"--- ETA Calculation (based on {num_frames_in_batch} frames) ---")
                     logging.info(f"Estimated total job duration: {datetime.timedelta(seconds=int(estimated_total_seconds))}")
-                    logging.info("-----------------------")
                     status['eta_logged'] = True
-                    with open(status_file, 'w') as f:
-                        json.dump(status, f, indent=4)
+                    with open(status_file, 'w') as f: json.dump(status, f, indent=4)
 
             frames_processed_so_far += num_frames_in_batch
             logging.info(f"--- Batch {batch_num} Complete ---")
@@ -453,8 +475,7 @@ def process_video(input_video_path):
         if USE_RAM_DISK and os.path.exists(TEMP_DIR_FRAMES):
             for dir_name in ['audio', 'frames_raw', 'frames_raw_tiled', 'frames_upscaled_tiled', 'frames_upscaled']:
                 dir_path = os.path.join(TEMP_DIR_FRAMES, dir_name)
-                if os.path.exists(dir_path):
-                    shutil.rmtree(dir_path)
+                if os.path.exists(dir_path): shutil.rmtree(dir_path)
         manage_ramdisk(mount=False)
         logging.info("Cleanup complete.")
 
@@ -465,33 +486,29 @@ def scan_for_incomplete_jobs():
     
     current_queue = []
     if os.path.exists(QUEUE_FILE):
-        with open(QUEUE_FILE, 'r') as f:
-            current_queue = [line.strip() for line in f.readlines()]
+        with open(QUEUE_FILE, 'r') as f: current_queue = [line.strip() for line in f.readlines()]
+
+    if not os.path.exists(INPUT_DIR): os.makedirs(INPUT_DIR)
 
     for video_file in os.listdir(INPUT_DIR):
-        if not video_file.lower().endswith(SUPPORTED_VIDEO_FORMATS):
-            continue
+        if not video_file.lower().endswith(SUPPORTED_VIDEO_FORMATS): continue
             
         input_video_path = os.path.join(INPUT_DIR, video_file)
         base_filename, _ = os.path.splitext(video_file)
         job_dir = os.path.join(OUTPUT_DIR, base_filename)
-        status_file = os.path.join(job_dir, 'status.json')
         final_output_file = os.path.join(OUTPUT_DIR, f"{base_filename}_upscaled.mp4")
 
-        # Check if the job is incomplete
-        if os.path.exists(status_file) and not os.path.exists(final_output_file):
-            if input_video_path not in current_queue:
-                logging.info(f"Found incomplete job for '{video_file}'. Adding to queue.")
-                current_queue.append(input_video_path)
+        if not os.path.exists(final_output_file):
+             if input_video_path not in current_queue:
+                logging.info(f"Found incomplete or new job for '{video_file}'. Adding to queue.")
+                current_queue.insert(0, input_video_path) # Prioritize resuming
                 resumed_jobs += 1
     
     if resumed_jobs > 0:
         with open(QUEUE_FILE, 'w') as f:
-            for job_path in current_queue:
-                f.write(f"{job_path}\n")
+            for job_path in current_queue: f.write(f"{job_path}\n")
     
-    logging.info(f"Scan complete. Resumed {resumed_jobs} incomplete job(s).")
-
+    logging.info(f"Scan complete. Found {resumed_jobs} job(s) to queue.")
 
 # --- AUTOMATION & FILE MONITORING ---
 
@@ -529,7 +546,6 @@ if __name__ == "__main__":
         logging.critical("Dependency check failed. The server cannot start.")
         sys.exit(1)
     
-    # Scan for incomplete jobs before starting the main loop
     scan_for_incomplete_jobs()
     
     observer = Observer()
@@ -561,3 +577,4 @@ if __name__ == "__main__":
         observer.stop()
         observer.join()
         logging.info("Server has been shut down successfully.")
+
